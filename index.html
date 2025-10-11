@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SoundCue JSON → UE SoundCueGraph Converter</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>SoundCue JSON → UE SoundCueGraph Converter</h1>
+      <p>
+        Upload a SoundCue JSON (FModel style) and get a combined Unreal SoundCueGraph export
+        (full hierarchy, per-child input slots, WavePlayers include <code>SoundWaveAssetPtr</code>).
+      </p>
+    </header>
+
+    <section class="controls">
+      <div class="file-wrapper">
+        <label class="file">
+          <input id="jsonFile" type="file" accept=".json,application/json" />
+          <span>Select SoundCue JSON</span>
+        </label>
+        <label class="checkbox">
+          <input id="includeGuids" type="checkbox" checked />
+          <span>Generate placeholder GUIDs &amp; PinIds</span>
+        </label>
+      </div>
+
+      <div class="button-wrapper">
+        <button id="convertBtn" disabled>Convert</button>
+        <button id="copyBtn" disabled>Copy Output</button>
+        <button id="downloadBtn" disabled>Download .txt</button>
+      </div>
+    </section>
+
+    <section class="output">
+      <textarea id="output" placeholder="Converted UE SoundCueGraph will appear here..." spellcheck="false"></textarea>
+    </section>
+
+    <section class="help">
+      <p>
+        <strong>Notes:</strong> The converter expects FModel-style SoundCue JSONs (array of objects).
+        Child references need an <code>ObjectPath</code> or an <code>ObjectName</code> ending with
+        <code>.N</code> where N is the original array index. The script tolerates small variations
+        and will leave comments for unresolved references.
+      </p>
+    </section>
+
+    <footer>
+      <small>Built for FModel-style SoundCue JSONs. Layout redesigned for clarity.</small>
+    </footer>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
