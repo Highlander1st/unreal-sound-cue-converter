@@ -1,19 +1,12 @@
 // script.js
 // SoundCue JSON -> Unreal SoundCueGraph converter
-// - Full-featured converter with:
-//   * lane-based subtree layout (preserves per-slot order)
-//   * root-on-right orientation (left->right flow visually)
-//   * vertical fan-out for multi-input nodes (Input/Input2/Input3 order)
-//   * per-column collision reduction
-//   * accurate per-slot CustomProperties Pin LinkedTo mapping
-//   * WavePlayer SoundWaveAssetPtr heuristics
-//   * Attenuation detection (uses JSON path or falls back to default fallback)
-//   * UI: file input, Convert, Copy, Download, include GUIDs checkbox
-// NOTE: Replace your existing script.js with this single block.
+// Latest working converter with fixed placement of comment bubble fields.
+// - Writes bCommentBubbleVisible & NodeComment at the graph-node level (same level as NodeGuid).
+// - Preserves all other functionality (layout, pins, wave assignment, attenuation fallback).
 
 (() => {
   // ---------------------------
-  // UI elements
+  // UI bindings
   // ---------------------------
   const fileInput = document.getElementById('jsonFile');
   const convertBtn = document.getElementById('convertBtn');
@@ -101,12 +94,59 @@
     return m ? parseInt(m[1], 10) : null;
   }
 
-  // ---------------------------
-  // Attenuation detection helper
-  // ---------------------------
-  function findAttenuationPathFromProps(props) {
+  // Generic asset path finder for many JSON shapes
+  function findAssetPathFromProps(props, candidateKeys = []) {
     if (!props || typeof props !== 'object') return null;
 
+    const defaults = [
+      'SoundWaveAssetPtr', 'SoundWave', 'SoundWaveObject', 'SoundWavePath', 'Wave', 'WaveAsset',
+      'AttenuationSettings', 'AttenuationAsset', 'SoundAttenuation', 'Attenuation', 'AttenuationPath',
+      'AssetPathName', 'ObjectPath', 'Asset', 'Path'
+    ];
+    const keys = Array.from(new Set([...candidateKeys, ...defaults]));
+
+    for (const key of keys) {
+      if (!(key in props)) continue;
+      const val = props[key];
+      if (!val) continue;
+      if (typeof val === 'string') {
+        let s = val.trim();
+        if (s.includes('/Game/')) {
+          s = s.replace(/\.\d+$/, '');
+          if (!s.includes('.')) {
+            const last = s.split('/').pop();
+            s = `${s}.${last}`;
+          }
+          return s;
+        }
+        if (/\.[A-Za-z0-9_]+$/.test(s)) {
+          return s.replace(/\.\d+$/, '');
+        }
+      } else if (typeof val === 'object') {
+        if (val.ObjectPath && typeof val.ObjectPath === 'string') {
+          let p = val.ObjectPath.replace(/\.\d+$/, '');
+          if (!p.includes('.')) { const last = p.split('/').pop(); p = `${p}.${last}`; }
+          return p;
+        }
+        if (val.AssetPathName && typeof val.AssetPathName === 'string') {
+          let p = val.AssetPathName.replace(/\.\d+$/, '');
+          if (!p.includes('.')) { const last = p.split('/').pop(); p = `${p}.${last}`; }
+          return p;
+        }
+        if (val.Asset && typeof val.Asset === 'string') {
+          let p = val.Asset.replace(/\.\d+$/, '');
+          if (p.includes('/Game/')) {
+            if (!p.includes('.')) { const last = p.split('/').pop(); p = `${p}.${last}`; }
+            return p;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function findAttenuationPathFromProps(props) {
     const candidateKeys = [
       'AttenuationSettings',
       'AttenuationAsset',
@@ -115,56 +155,29 @@
       'AttenuationPreset',
       'AttenuationObject',
       'AttenuationPath',
-      'AttenuationName'
+      'AttenuationName',
+      'AssetPathName',
+      'ObjectPath'
     ];
-
-    for (const key of candidateKeys) {
-      if (!(key in props)) continue;
-      const val = props[key];
-      if (!val) continue;
-      if (typeof val === 'object') {
-        if (val.ObjectPath && typeof val.ObjectPath === 'string' && val.ObjectPath.includes('/Game/')) {
-          let p = val.ObjectPath.replace(/\.\d+$/, '');
-          if (!p.includes('.')) { const last = p.split('/').pop(); p = `${p}.${last}`; }
-          return p;
-        }
-        if (val.AssetPathName && typeof val.AssetPathName === 'string' && val.AssetPathName.includes('/Game/')) {
-          return val.AssetPathName;
-        }
-      } else if (typeof val === 'string') {
-        let s = val.trim();
-        if (s.includes('/Game/')) {
-          s = s.replace(/\.\d+$/, '');
-          if (!s.includes('.')) { const last = s.split('/').pop(); s = `${s}.${last}`; }
-          return s;
-        }
-        // also accept "Path.Asset" style already
-        if (/\.[A-Za-z0-9_]+$/.test(s)) {
-          return s.replace(/\.\d+$/, '');
-        }
-      }
-    }
-
-    if (props.AttenuationSettings && typeof props.AttenuationSettings === 'object') {
-      const candidate = props.AttenuationSettings.ObjectPath || props.AttenuationSettings.AssetPathName;
-      if (candidate && typeof candidate === 'string') {
-        let p = candidate.replace(/\.\d+$/, '');
-        if (!p.includes('.')) { const last = p.split('/').pop(); p = `${p}.${last}`; }
-        return p;
-      }
-    }
-
+    const p = findAssetPathFromProps(props, candidateKeys);
+    if (p) return p;
     return null;
   }
 
+  function assetNameFromPath(path) {
+    if (!path || typeof path !== 'string') return null;
+    const cleaned = path.replace(/\.\d+$/, '');
+    if (cleaned.includes('.')) return cleaned.split('.').pop();
+    const parts = cleaned.split('/');
+    return parts.pop() || cleaned;
+  }
+
   // ---------------------------
-  // Layout & metadata builder (restores advanced sorting)
-  // Returns { arr, exportBasePath, nodeMap, parentToChildren }
+  // Layout & metadata (advanced lane layout)
   // ---------------------------
   function buildLayoutAndMetadata(arr, includeGuids = true) {
     if (!Array.isArray(arr) || arr.length === 0) throw new Error('Input must be a non-empty array.');
 
-    // If the JSON is in the "Exports" style (your earlier files), normalize:
     const normalizedArr = Array.isArray(arr) ? arr : (arr.Exports || arr);
 
     // find SoundCue for naming
@@ -184,7 +197,7 @@
 
     const nodeMap = {};
     const parentToChildren = {};
-    const childToParent = {};
+    const childToParents = {};
     const typeCounters = {};
 
     function nextName(type) {
@@ -192,7 +205,7 @@
       return `${type}_${typeCounters[type] - 1}`;
     }
 
-    // Precompute child counts to size inputPinIds
+    // Precompute child counts
     const childCounts = new Array(normalizedArr.length).fill(1);
     for (let i = 0; i < normalizedArr.length; i++) {
       const props = normalizedArr[i].Properties || {};
@@ -200,7 +213,7 @@
       else childCounts[i] = 1;
     }
 
-    // initialize nodeMap
+    // Initialize nodeMap
     for (let i = 0; i < normalizedArr.length; i++) {
       const type = normalizedArr[i].Type || 'SoundNodeUnknown';
       nodeMap[i] = {
@@ -219,7 +232,7 @@
       };
     }
 
-    // build parentToChildren preserving slot order
+    // Build parentToChildren preserving slot order
     for (let i = 0; i < normalizedArr.length; i++) {
       const props = normalizedArr[i].Properties || {};
       const children = Array.isArray(props.ChildNodes) ? props.ChildNodes : [];
@@ -229,28 +242,31 @@
         const op = ref?.ObjectPath || ref?.ObjectName || ref;
         const idx = parseRefIndex(op);
         parentToChildren[i].push(idx ?? null);
-        if (idx != null) childToParent[idx] = i; // track one parent (used for roots)
+        if (idx != null) {
+          childToParents[idx] = childToParents[idx] || [];
+          childToParents[idx].push(i);
+        }
       }
     }
 
-    // roots are nodes without any parent
+    // roots
     const allIndices = normalizedArr.map((_, i) => i);
-    const roots = allIndices.filter(i => !(i in childToParent));
+    const roots = allIndices.filter(i => !(i in childToParents));
     const layoutRoots = roots.length ? roots : [0];
 
-    // layout constants
+    // layout consts
     const xStep = 420;
     const yStep = 250;
     const regionGap = 800;
 
-    // compute subtree height function (in lanes)
+    // compute subtree heights
     const visited = new Array(normalizedArr.length).fill(false);
-    function dfsHeight(i) {
-      if (visited[i]) return nodeMap[i].subtreeHeight;
-      const children = parentToChildren[i] || [];
+    function dfsHeight(idx) {
+      if (visited[idx]) return nodeMap[idx].subtreeHeight;
+      const children = parentToChildren[idx] || [];
       if (!children.length) {
-        nodeMap[i].subtreeHeight = 1;
-        visited[i] = true;
+        nodeMap[idx].subtreeHeight = 1;
+        visited[idx] = true;
         return 1;
       }
       let total = 0;
@@ -258,9 +274,9 @@
         if (c == null) total += 1;
         else total += Math.max(1, dfsHeight(c));
       }
-      nodeMap[i].subtreeHeight = Math.max(1, total);
-      visited[i] = true;
-      return nodeMap[i].subtreeHeight;
+      nodeMap[idx].subtreeHeight = Math.max(1, total);
+      visited[idx] = true;
+      return nodeMap[idx].subtreeHeight;
     }
     for (const r of layoutRoots) dfsHeight(r);
 
@@ -274,7 +290,7 @@
       if (ri < layoutRoots.length - 1) laneCursor += Math.ceil(regionGap / yStep);
     }
 
-    // assign lanes recursively, preserving slot order
+    // assign lanes recursively
     function assignLanes(idx, start) {
       const children = parentToChildren[idx] || [];
       if (!children.length) {
@@ -303,10 +319,9 @@
       nodeMap[idx].laneEnd = unique[unique.length - 1];
       return unique.length;
     }
-
     for (const r of layoutRoots) assignLanes(r, rootLaneStart[r]);
 
-    // lane -> Y mapping and depth map
+    // lane->Y mapping
     let minLane = Infinity, maxLane = -Infinity;
     for (const k of Object.keys(nodeMap)) {
       const nm = nodeMap[k];
@@ -318,7 +333,7 @@
     const globalLaneCenter = (minLane + maxLane) / 2;
     function laneToY(l) { return Math.round((l - globalLaneCenter) * yStep); }
 
-    // compute depth (distance from roots) via BFS
+    // depth map BFS
     const depthMap = new Array(normalizedArr.length).fill(null);
     const q = [];
     for (const r of layoutRoots) { depthMap[r] = 0; q.push(r); }
@@ -336,7 +351,7 @@
     for (let i = 0; i < normalizedArr.length; i++) if (depthMap[i] === null) depthMap[i] = 0;
     const maxDepth = Math.max(...depthMap);
 
-    // assign positions: X inverted so root is rightmost
+    // assign positions (root on right)
     for (const k of Object.keys(nodeMap)) {
       const n = nodeMap[k];
       n.posX = (maxDepth - (depthMap[k] || 0)) * xStep;
@@ -346,7 +361,7 @@
       } else n.posY = 0;
     }
 
-    // per-column vertical collision reduction
+    // per-column collision reduction
     const buckets = {};
     for (const k of Object.keys(nodeMap)) {
       const n = nodeMap[k];
@@ -365,12 +380,12 @@
     }
 
     // center vertically
-    const allY = Object.values(nodeMap).map(n => n.posY);
-    const minY = allY.length ? Math.min(...allY) : 0;
-    const maxY = allY.length ? Math.max(...allY) : 0;
-    const mid = (minY + maxY) / 2;
+    const allYs = Object.values(nodeMap).map(n => n.posY);
+    const finalMin = allYs.length ? Math.min(...allYs) : 0;
+    const finalMax = allYs.length ? Math.max(...allYs) : 0;
+    const finalMid = (finalMin + finalMax) / 2;
     for (const nm of Object.values(nodeMap)) {
-      nm.posY = Math.round(nm.posY - mid);
+      nm.posY = Math.round(nm.posY - finalMid);
       nm.posX = Math.round(nm.posX);
     }
 
@@ -378,7 +393,7 @@
   }
 
   // ---------------------------
-  // Finalize export (serialize to Unreal text, populate LinkedTo)
+  // Serialize with comment fields at graph-node level
   // ---------------------------
   function finalizeExport({ arr, exportBasePath, nodeMap, parentToChildren }) {
     function graphNodeHeader(i) {
@@ -396,94 +411,111 @@
       const engineType = el.Type || 'SoundNodeUnknown';
       const nodeName = map.soundNodeName;
 
-      let b = '';
-      b += graphNodeHeader(i);
-      b += `   Begin Object Class=/Script/Engine.${engineType} Name="${nodeName}" ExportPath="${engineExportPath(engineType, i, nodeName)}'">\n`;
-      b += `   End Object\n`;
-      b += `   Begin Object Name="${nodeName}" ExportPath="${engineExportPath(engineType, i, nodeName)}'\n`;
+      // Build inner engine object block
+      let inner = '';
+      inner += `   Begin Object Class=/Script/Engine.${engineType} Name="${nodeName}" ExportPath="${engineExportPath(engineType, i, nodeName)}'">\n`;
+      inner += `   End Object\n`;
+      inner += `   Begin Object Name="${nodeName}" ExportPath="${engineExportPath(engineType, i, nodeName)}'\n`;
 
-      // Insert attenuation if this node is attenuation type
+      // We'll collect comment text for placement at graph-node level
+      let nodeCommentText = '';
+      let willHaveComment = true; // we will always write bubble visible (user asked for visible bubble)
+
+      // Handle specific node types
       if (engineType === 'SoundNodeAttenuation') {
         const found = findAttenuationPathFromProps(props);
         const attenuationPath = found || '/Game/Sounds/Attenuation/Default_Attenuation.Default_Attenuation';
-        b += `      AttenuationSettings="/Script/Engine.SoundAttenuation'${attenuationPath}'"\n`;
-        b += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        inner += `      AttenuationSettings="/Script/Engine.SoundAttenuation'${attenuationPath}'"\n`;
+        inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        nodeCommentText = assetNameFromPath(attenuationPath) || '';
       } else if (engineType === 'SoundNodeWavePlayer') {
-        // WavePlayer heuristics
+        // resolve sound wave
         let resolved = null;
-        if (props.SoundWaveAssetPtr) {
-          if (typeof props.SoundWaveAssetPtr === 'string') resolved = props.SoundWaveAssetPtr;
-          else if (typeof props.SoundWaveAssetPtr === 'object' && props.SoundWaveAssetPtr.AssetPathName) resolved = props.SoundWaveAssetPtr.AssetPathName;
+        if ('SoundWaveAssetPtr' in props) {
+          const v = props.SoundWaveAssetPtr;
+          if (typeof v === 'string') resolved = v;
+          else if (v && typeof v === 'object' && v.AssetPathName) resolved = v.AssetPathName;
         }
-        if (!resolved && props.SoundWave) {
+        if (!resolved && 'SoundWave' in props) {
           const sw = props.SoundWave;
           if (typeof sw === 'string') resolved = sw.replace(/\.\d+$/, '');
-          else if (sw.ObjectPath) resolved = sw.ObjectPath.replace(/\.\d+$/, '');
-          if (resolved && !resolved.includes('.')) {
-            const last = resolved.split('/').pop();
-            resolved = `${resolved}.${last}`;
-          }
+          else if (sw && typeof sw === 'object' && sw.ObjectPath) resolved = sw.ObjectPath.replace(/\.\d+$/, '');
         }
-        if (!resolved && el.SoundWave && el.SoundWave.ObjectPath) {
-          const p = el.SoundWave.ObjectPath.replace(/\.\d+$/, '');
-          const last = p.split('/').pop();
-          resolved = `${p}.${last}`;
+        if (!resolved && el && el.SoundWave && el.SoundWave.ObjectPath) {
+          resolved = el.SoundWave.ObjectPath.replace(/\.\d+$/, '');
         }
-        if (resolved) b += `      SoundWaveAssetPtr="${resolved}"\n`;
-        else b += `      /* SoundWaveAssetPtr unresolved for this WavePlayer */\n`;
-        b += `      bLooping=${props.bLooping ? 'True' : 'False'}\n`;
-        b += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        if (resolved && !resolved.includes('.')) {
+          const last = resolved.split('/').pop();
+          resolved = `${resolved}.${last}`;
+        }
+        if (resolved) inner += `      SoundWaveAssetPtr="${resolved}"\n`;
+        else inner += `      /* SoundWaveAssetPtr unresolved for this WavePlayer */\n`;
+        inner += `      bLooping=${props.bLooping ? 'True' : 'False'}\n`;
+        inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        nodeCommentText = assetNameFromPath(resolved) || '';
       } else {
-        // Generic properties
         if (engineType === 'SoundNodeMixer' && Array.isArray(props.InputVolume)) {
           for (let vi = 0; vi < props.InputVolume.length; vi++) {
             const val = Number(props.InputVolume[vi]) || 0;
-            b += `      InputVolume(${vi})=${val.toFixed(6)}\n`;
+            inner += `      InputVolume(${vi})=${val.toFixed(6)}\n`;
           }
         }
         if (engineType === 'SoundNodeModulator') {
-          if (props.PitchMin !== undefined) b += `      PitchMin=${Number(props.PitchMin).toFixed(6)}\n`;
-          if (props.PitchMax !== undefined) b += `      PitchMax=${Number(props.PitchMax).toFixed(6)}\n`;
+          if (props.PitchMin !== undefined) inner += `      PitchMin=${Number(props.PitchMin).toFixed(6)}\n`;
+          if (props.PitchMax !== undefined) inner += `      PitchMax=${Number(props.PitchMax).toFixed(6)}\n`;
         }
-        b += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        nodeCommentText = '';
       }
 
-      // ChildNodes (preserve slot order)
+      // ChildNodes
       const children = parentToChildren[i] || [];
       for (let ci = 0; ci < children.length; ci++) {
         const cIdx = children[ci];
-        if (cIdx == null) {
-          b += `      /* ChildNodes(${ci}) unresolved */\n`;
-        } else {
+        if (cIdx == null) inner += `      /* ChildNodes(${ci}) unresolved */\n`;
+        else {
           const child = nodeMap[cIdx];
           const childPath = `/Script/Engine.${child.soundNodeType}'${exportBasePath}:SoundCueGraph_0.SoundCueGraphNode_${cIdx}.${child.soundNodeName}'`;
-          b += `      ChildNodes(${ci})="${childPath}"\n`;
+          inner += `      ChildNodes(${ci})="${childPath}"\n`;
         }
       }
 
-      b += `   End Object\n`;
-      b += `   SoundNode="/Script/Engine.${engineType}'${nodeName}'"\n`;
-      b += `   NodePosX=${map.posX}\n`;
-      b += `   NodePosY=${map.posY}\n`;
-      b += `   NodeGuid=${map.nodeGuid}\n`;
+      inner += `   End Object\n`;
+
+      // Build the graph-node wrapper (with NodePosX/Y and comment fields at the same level as NodeGuid)
+      let block = '';
+      block += graphNodeHeader(i);
+      block += inner;
+      block += `   SoundNode="/Script/Engine.${engineType}'${nodeName}'"\n`;
+      block += `   NodePosX=${map.posX}\n`;
+      block += `   NodePosY=${map.posY}\n`;
+
+      // Insert the comment bubble fields HERE (same level as NodeGuid) for WavePlayers & Attenuation
+      // For others, still write visible bubble with empty comment (per user preference)
+      const safeComment = String(nodeCommentText || '').replace(/"/g, '\\"');
+      block += `   bCommentBubbleVisible=True\n`;
+      block += `   NodeComment="${safeComment}"\n`;
+
+      // NodeGuid next
+      block += `   NodeGuid=${map.nodeGuid}\n`;
 
       // Output pin placeholder
-      b += `   CustomProperties Pin (PinId=${map.outputPinId},PinName="Output",Direction="EGPD_Output",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(),PersistentGuid=00000000000000000000000000000000,)\n`;
+      block += `   CustomProperties Pin (PinId=${map.outputPinId},PinName="Output",Direction="EGPD_Output",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(),PersistentGuid=00000000000000000000000000000000,)\n`;
 
-      // Input pins (one per slot)
+      // Input pins
       for (let ci = 0; ci < map.inputPinIds.length; ci++) {
         const label = ci === 0 ? 'Input' : `Input${ci + 1}`;
-        b += `   CustomProperties Pin (PinId=${map.inputPinIds[ci]},PinName="${label}",PinFriendlyName=" ",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(),PersistentGuid=00000000000000000000000000000000,)\n`;
+        block += `   CustomProperties Pin (PinId=${map.inputPinIds[ci]},PinName="${label}",PinFriendlyName=" ",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(),PersistentGuid=00000000000000000000000000000000,)\n`;
       }
 
-      b += `End Object\n\n`;
-      blocks[i] = b;
+      block += `End Object\n\n`;
+      blocks[i] = block;
     }
 
-    // join blocks
+    // Combine blocks
     let combined = blocks.join('');
 
-    // populate LinkedTo per-slot (parent.input[s] -> child.output) and append reciprocal entries
+    // Populate LinkedTo mapping per-slot
     for (const [pStr, children] of Object.entries(parentToChildren)) {
       const p = Number(pStr);
       const pMap = nodeMap[p];
@@ -495,7 +527,7 @@
         const parentPinId = pMap.inputPinIds[s];
         const childOutputPinId = cMap.outputPinId;
 
-        // parent input: replace LinkedTo=()
+        // parent input: set LinkedTo
         const parentInputRe = new RegExp(`CustomProperties Pin \\(PinId=${escapeRegex(parentPinId)}[^\\)]*LinkedTo=\\(\\)`, 'm');
         const parentReplacement = `CustomProperties Pin (PinId=${parentPinId},PinName="${s===0 ? 'Input' : 'Input'+(s+1)}",PinFriendlyName=" ",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(SoundCueGraphNode_${cIdx} ${childOutputPinId},),PersistentGuid=00000000000000000000000000000000,)`;
         combined = combined.replace(parentInputRe, parentReplacement);
@@ -510,9 +542,9 @@
           const replacement = `CustomProperties Pin (PinId=${childOutputPinId},PinName="Output",Direction="EGPD_Output",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(${newInner}),PersistentGuid=00000000000000000000000000000000,)`;
           combined = combined.replace(childOutputRe, replacement);
         } else {
-          // fallback: create output pin line with LinkedTo
-          const fallbackRe = new RegExp(`CustomProperties Pin \\(PinId=${escapeRegex(childOutputPinId)}[^\\n]*\\)\\n`, 'm');
-          combined = combined.replace(fallbackRe, `   CustomProperties Pin (PinId=${childOutputPinId},PinName="Output",Direction="EGPD_Output",PinType.PinCategory="SoundNode",LinkedTo=(SoundCueGraphNode_${p} ${parentPinId},),PersistentGuid=00000000000000000000000000000000,)\n`);
+          // fallback: replace bare output pin line
+          const fallbackOutPinRe = new RegExp(`CustomProperties Pin \\(PinId=${escapeRegex(childOutputPinId)}[^\\n]*\\)\\n`, 'm');
+          combined = combined.replace(fallbackOutPinRe, `   CustomProperties Pin (PinId=${childOutputPinId},PinName="Output",Direction="EGPD_Output",PinType.PinCategory="SoundNode",LinkedTo=(SoundCueGraphNode_${p} ${parentPinId},),PersistentGuid=00000000000000000000000000000000,)\n`);
         }
       }
     }
@@ -520,17 +552,16 @@
     return combined;
   }
 
-  // ---------------------------
-  // Full conversion entry
-  // ---------------------------
+  // Top-level conversion
   function convertSoundCueJsonFull(json, includeGuids = true) {
-    // Accept both array-style exports or object containing Exports
     const arr = Array.isArray(json) ? json : (json.Exports || json);
+    if (!arr || !arr.length) throw new Error('Invalid JSON: expected array or Exports');
     const struct = buildLayoutAndMetadata(arr, includeGuids);
-    const final = finalizeExport(struct);
-    return final;
+    const out = finalizeExport(struct);
+    return out;
   }
 
-  // expose for UI
+  // expose
   window.convertSoundCueJsonFull = convertSoundCueJsonFull;
+  window.convertSoundCueJson = convertSoundCueJsonFull;
 })();
