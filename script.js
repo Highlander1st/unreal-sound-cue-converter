@@ -1,8 +1,11 @@
 // script.js
 // SoundCue JSON -> Unreal SoundCueGraph converter
-// Latest working converter with fixed placement of comment bubble fields.
-// - Writes bCommentBubbleVisible & NodeComment at the graph-node level (same level as NodeGuid).
-// - Preserves all other functionality (layout, pins, wave assignment, attenuation fallback).
+// Latest working converter with added:
+// - SoundNodeModulator: VolumeMin / VolumeMax (six-decimal precision)
+// - SoundNodeDelay: DelayMin / DelayMax (six-decimal precision)
+// Preserves: layout, pin linking, inline node comments at graph-node level,
+// attenuation fallback to /Game/Sounds/Attenuation/Default_Attenuation.Default_Attenuation,
+// SoundWave assignment heuristics, and UI.
 
 (() => {
   // ---------------------------
@@ -173,7 +176,7 @@
   }
 
   // ---------------------------
-  // Layout & metadata (advanced lane layout)
+  // Layout & metadata (lane sorting)
   // ---------------------------
   function buildLayoutAndMetadata(arr, includeGuids = true) {
     if (!Array.isArray(arr) || arr.length === 0) throw new Error('Input must be a non-empty array.');
@@ -205,7 +208,7 @@
       return `${type}_${typeCounters[type] - 1}`;
     }
 
-    // Precompute child counts
+    // precompute child counts
     const childCounts = new Array(normalizedArr.length).fill(1);
     for (let i = 0; i < normalizedArr.length; i++) {
       const props = normalizedArr[i].Properties || {};
@@ -213,7 +216,6 @@
       else childCounts[i] = 1;
     }
 
-    // Initialize nodeMap
     for (let i = 0; i < normalizedArr.length; i++) {
       const type = normalizedArr[i].Type || 'SoundNodeUnknown';
       nodeMap[i] = {
@@ -232,7 +234,7 @@
       };
     }
 
-    // Build parentToChildren preserving slot order
+    // build parentToChildren preserving slot order
     for (let i = 0; i < normalizedArr.length; i++) {
       const props = normalizedArr[i].Properties || {};
       const children = Array.isArray(props.ChildNodes) ? props.ChildNodes : [];
@@ -290,7 +292,7 @@
       if (ri < layoutRoots.length - 1) laneCursor += Math.ceil(regionGap / yStep);
     }
 
-    // assign lanes recursively
+    // assign lanes recursively preserving slot order
     function assignLanes(idx, start) {
       const children = parentToChildren[idx] || [];
       if (!children.length) {
@@ -361,7 +363,7 @@
       } else n.posY = 0;
     }
 
-    // per-column collision reduction
+    // per-column anti-overlap
     const buckets = {};
     for (const k of Object.keys(nodeMap)) {
       const n = nodeMap[k];
@@ -393,7 +395,7 @@
   }
 
   // ---------------------------
-  // Serialize with comment fields at graph-node level
+  // Serialize with inline comment fields at graph-node level and new overrides
   // ---------------------------
   function finalizeExport({ arr, exportBasePath, nodeMap, parentToChildren }) {
     function graphNodeHeader(i) {
@@ -417,11 +419,11 @@
       inner += `   End Object\n`;
       inner += `   Begin Object Name="${nodeName}" ExportPath="${engineExportPath(engineType, i, nodeName)}'\n`;
 
-      // We'll collect comment text for placement at graph-node level
+      // We'll collect NodeComment text for placement at graph-node level
       let nodeCommentText = '';
-      let willHaveComment = true; // we will always write bubble visible (user asked for visible bubble)
+      const showCommentBubble = true; // keep bubble visible (per previous user preference)
 
-      // Handle specific node types
+      // Handle specific node types and new overrides
       if (engineType === 'SoundNodeAttenuation') {
         const found = findAttenuationPathFromProps(props);
         const attenuationPath = found || '/Game/Sounds/Attenuation/Default_Attenuation.Default_Attenuation';
@@ -429,7 +431,6 @@
         inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
         nodeCommentText = assetNameFromPath(attenuationPath) || '';
       } else if (engineType === 'SoundNodeWavePlayer') {
-        // resolve sound wave
         let resolved = null;
         if ('SoundWaveAssetPtr' in props) {
           const v = props.SoundWaveAssetPtr;
@@ -453,7 +454,27 @@
         inner += `      bLooping=${props.bLooping ? 'True' : 'False'}\n`;
         inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
         nodeCommentText = assetNameFromPath(resolved) || '';
+      } else if (engineType === 'SoundNodeModulator') {
+        // Pitch overrides
+        if (props.PitchMin !== undefined) inner += `      PitchMin=${Number(props.PitchMin).toFixed(6)}\n`;
+        if (props.PitchMax !== undefined) inner += `      PitchMax=${Number(props.PitchMax).toFixed(6)}\n`;
+
+        // NEW: Volume overrides for modulator nodes
+        if (props.VolumeMin !== undefined) inner += `      VolumeMin=${Number(props.VolumeMin).toFixed(6)}\n`;
+        if (props.VolumeMax !== undefined) inner += `      VolumeMax=${Number(props.VolumeMax).toFixed(6)}\n`;
+
+        inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        // modulator comment not necessarily useful, leave empty unless a SoundWave is referenced (rare)
+        nodeCommentText = '';
+      } else if (engineType === 'SoundNodeDelay') {
+        // NEW: Delay overrides
+        if (props.DelayMin !== undefined) inner += `      DelayMin=${Number(props.DelayMin).toFixed(6)}\n`;
+        if (props.DelayMax !== undefined) inner += `      DelayMax=${Number(props.DelayMax).toFixed(6)}\n`;
+
+        inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
+        nodeCommentText = '';
       } else {
+        // other nodes (Mixer, SoundClass, etc.)
         if (engineType === 'SoundNodeMixer' && Array.isArray(props.InputVolume)) {
           for (let vi = 0; vi < props.InputVolume.length; vi++) {
             const val = Number(props.InputVolume[vi]) || 0;
@@ -461,8 +482,16 @@
           }
         }
         if (engineType === 'SoundNodeModulator') {
+          // already handled above, but keep guard
           if (props.PitchMin !== undefined) inner += `      PitchMin=${Number(props.PitchMin).toFixed(6)}\n`;
           if (props.PitchMax !== undefined) inner += `      PitchMax=${Number(props.PitchMax).toFixed(6)}\n`;
+        }
+        if (engineType === 'SoundNodeModulator') {
+          if (props.VolumeMin !== undefined) inner += `      VolumeMin=${Number(props.VolumeMin).toFixed(6)}\n`;
+          if (props.VolumeMax !== undefined) inner += `      VolumeMax=${Number(props.VolumeMax).toFixed(6)}\n`;
+        }
+        if (engineType === 'SoundNodeModulator' || engineType === 'SoundNodeMixer' || engineType === 'SoundNodeSoundClass') {
+          // no-op: already attempted to include relevant props
         }
         inner += `      GraphNode="/Script/AudioEditor.SoundCueGraphNode'SoundCueGraphNode_${i}'"\n`;
         nodeCommentText = '';
@@ -482,7 +511,7 @@
 
       inner += `   End Object\n`;
 
-      // Build the graph-node wrapper (with NodePosX/Y and comment fields at the same level as NodeGuid)
+      // Build the graph-node wrapper with comment fields at graph-node level
       let block = '';
       block += graphNodeHeader(i);
       block += inner;
@@ -490,13 +519,11 @@
       block += `   NodePosX=${map.posX}\n`;
       block += `   NodePosY=${map.posY}\n`;
 
-      // Insert the comment bubble fields HERE (same level as NodeGuid) for WavePlayers & Attenuation
-      // For others, still write visible bubble with empty comment (per user preference)
+      // Insert comment bubble fields here (graph-node level)
       const safeComment = String(nodeCommentText || '').replace(/"/g, '\\"');
       block += `   bCommentBubbleVisible=True\n`;
       block += `   NodeComment="${safeComment}"\n`;
 
-      // NodeGuid next
       block += `   NodeGuid=${map.nodeGuid}\n`;
 
       // Output pin placeholder
@@ -512,10 +539,10 @@
       blocks[i] = block;
     }
 
-    // Combine blocks
+    // Combine blocks into single output
     let combined = blocks.join('');
 
-    // Populate LinkedTo mapping per-slot
+    // Populate LinkedTo mapping: parent input pin -> child output pin, and add reciprocal references
     for (const [pStr, children] of Object.entries(parentToChildren)) {
       const p = Number(pStr);
       const pMap = nodeMap[p];
@@ -527,12 +554,12 @@
         const parentPinId = pMap.inputPinIds[s];
         const childOutputPinId = cMap.outputPinId;
 
-        // parent input: set LinkedTo
+        // Update parent's input LinkedTo
         const parentInputRe = new RegExp(`CustomProperties Pin \\(PinId=${escapeRegex(parentPinId)}[^\\)]*LinkedTo=\\(\\)`, 'm');
         const parentReplacement = `CustomProperties Pin (PinId=${parentPinId},PinName="${s===0 ? 'Input' : 'Input'+(s+1)}",PinFriendlyName=" ",PinType.PinCategory="SoundNode",PinType.PinSubCategory="",LinkedTo=(SoundCueGraphNode_${cIdx} ${childOutputPinId},),PersistentGuid=00000000000000000000000000000000,)`;
         combined = combined.replace(parentInputRe, parentReplacement);
 
-        // child output: append parent ref
+        // Append parent ref to child's output LinkedTo
         const childOutputRe = new RegExp(`CustomProperties Pin \\(PinId=${escapeRegex(childOutputPinId)}[^\\)]*LinkedTo=\\(([^\\)]*)\\)`, 'm');
         const m = combined.match(childOutputRe);
         const parentRefText = `SoundCueGraphNode_${p} ${parentPinId},`;
@@ -552,7 +579,9 @@
     return combined;
   }
 
-  // Top-level conversion
+  // ---------------------------
+  // Top-level conversion entry
+  // ---------------------------
   function convertSoundCueJsonFull(json, includeGuids = true) {
     const arr = Array.isArray(json) ? json : (json.Exports || json);
     if (!arr || !arr.length) throw new Error('Invalid JSON: expected array or Exports');
@@ -561,7 +590,7 @@
     return out;
   }
 
-  // expose
+  // expose for debugging
   window.convertSoundCueJsonFull = convertSoundCueJsonFull;
   window.convertSoundCueJson = convertSoundCueJsonFull;
 })();
